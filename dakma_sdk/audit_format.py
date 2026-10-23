@@ -490,16 +490,23 @@ def format_inference_result_markdown(
 
     parts.append("")
     parts.append("**Explainability**")
+    meta = explain.get("metadata") or {}
+    quality = explain.get("quality") or {}
     exp_rows = [
         ("audit_trail_id", explain.get("audit_trail_id")),
         ("model_version", explain.get("model_version")),
         (
             "attribution",
-            explain.get("attribution_backend") or "shap",
+            explain.get("attribution_backend") or explain.get("method") or "shap",
         ),
+        ("status", explain.get("status") or "—"),
         ("plain_language", explain.get("plain_language")),
         ("counterfactual", explain.get("counterfactual") or "—"),
     ]
+    if meta.get("attribution_error"):
+        exp_rows.append(("attribution_error", meta.get("attribution_error")))
+    if quality.get("used_fallback"):
+        exp_rows.append(("used_fallback", True))
     parts.append(_markdown_table(["Field", "Value"], exp_rows))
 
     flags = explain.get("regulation_flags") or []
@@ -1135,16 +1142,23 @@ def format_inference_result_html(
     parts.append(_html_table(["decision"], [[_cell(raw_decision)]]))
 
     parts.append(_html_h3("Explainability"))
+    meta_html = explain.get("metadata") or {}
+    quality_html = explain.get("quality") or {}
     exp_rows = [
         ("audit_trail_id", explain.get("audit_trail_id")),
         ("model_version", explain.get("model_version")),
         (
             "attribution",
-            explain.get("attribution_backend") or "shap",
+            explain.get("attribution_backend") or explain.get("method") or "shap",
         ),
+        ("status", explain.get("status") or "—"),
         ("plain_language", explain.get("plain_language")),
         ("counterfactual", explain.get("counterfactual") or "—"),
     ]
+    if meta_html.get("attribution_error"):
+        exp_rows.append(("attribution_error", meta_html.get("attribution_error")))
+    if quality_html.get("used_fallback"):
+        exp_rows.append(("used_fallback", True))
     parts.append(_html_table(["Field", "Value"], exp_rows))
 
     flags = explain.get("regulation_flags") or []

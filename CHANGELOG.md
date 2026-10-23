@@ -5,6 +5,27 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-10-22
+
+### Fixed
+
+- Local SHAP explanations now slice binary and multi-class attribution tensors to the scored class
+  (aligned with `_extract_score` / last output index). This restores real SHAP factors for
+  RandomForest / XGBoost multi-class models that previously fell through to the placeholder
+  `feature_value × 0.01` path.
+
+### Changed
+
+- When SHAP fails and the coefficient / `value × 0.01` fallback is used, the explanation is marked
+  `status="degraded"` with `metadata["attribution_error"]` prefixed by `fallback_used:` and
+  `quality["used_fallback"]=true`. Decision and audit reports surface these fields.
+
+### Added
+
+- Regression tests for multi-class SHAP on Iris RandomForest and XGBoost
+  (`tests/test_multiclass_shap.py`), plus unit coverage for class-axis slicing and fallback
+  degradation.
+
 ## [1.0.0] - 2026-10-08
 
 ### Added
@@ -75,6 +96,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - This is an **alpha** release (`Development Status :: 3 - Alpha`).
 - Reports and governance blocks are **documentation aids**, not legal or regulatory certification.
 
+[1.1.0]: https://github.com/dakmaai/open_explainable_sdk/releases/tag/v1.1.0
 [1.0.0]: https://github.com/dakmaai/open_explainable_sdk/releases/tag/v1.0.0
 [0.5.0]: https://github.com/dakmaai/open_explainable_sdk/releases/tag/v0.5.0
 [0.1.0]: https://github.com/dakmaai/open_explainable_sdk/releases/tag/v0.1.0

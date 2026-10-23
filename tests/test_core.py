@@ -101,3 +101,63 @@ class TestRegulationFlags:
         assert flags[0] == "Governance documentation fields: 0/5 populated"
         assert flags[1] == "Policy context: custom-policy"
         assert "Documentation aid only" in flags[2]
+
+
+class TestLocalShapVector:
+    def test_one_dimensional_passthrough(self) -> None:
+        vec = DakmaClient._local_shap_vector(np.array([0.1, -0.2, 0.3]), n_features=3)
+        assert vec.tolist() == pytest.approx([0.1, -0.2, 0.3])
+
+    def test_feature_by_class_defaults_to_last_class(self) -> None:
+        # shape (n_features, n_classes) — binary / multi-class layout
+        vals = np.array([[0.1, 0.9], [-0.2, 0.4], [0.0, -0.5]])
+        vec = DakmaClient._local_shap_vector(vals, n_features=3)
+        assert vec.tolist() == pytest.approx([0.9, 0.4, -0.5])
+
+    def test_feature_by_class_respects_class_index(self) -> None:
+        vals = np.array([[0.1, 0.9, 0.3], [-0.2, 0.4, 0.7]])
+        vec = DakmaClient._local_shap_vector(vals, n_features=2, class_index=0)
+        assert vec.tolist() == pytest.approx([0.1, -0.2])
+
+    def test_class_by_feature_layout(self) -> None:
+        vals = np.array([[0.1, -0.2, 0.0], [0.9, 0.4, -0.5]])
+        vec = DakmaClient._local_shap_vector(vals, n_features=3, class_index=1)
+        assert vec.tolist() == pytest.approx([0.9, 0.4, -0.5])
+
+    def test_mismatched_shape_raises(self) -> None:
+        with pytest.raises(ValueError, match="Unsupported SHAP value shape"):
+            DakmaClient._local_shap_vector(np.ones((2, 2, 2)), n_features=2)
+
+
+class TestTopFactorsFallbackSurfacing:
+    def test_fallback_marks_degraded_and_records_error(self, client: DakmaClient) -> None:
+        class BrokenShapModel:
+            def predict_proba(self, X):
+                return np.array([[0.2, 0.8]])
+
+            def get_params(self, deep: bool = True):
+                return {}
+
+        model = BrokenShapModel()
+        row = {"f0": 10.0, "f1": -5.0, "f2": 1.0}
+
+        # Force SHAP path to fail by monkeypatching the SHAP helper.
+        client._top_factors_shap = lambda *a, **k: ([], "RuntimeError: boom")  # type: ignore[method-assign]
+        factors, err = client._top_factors(model, row, top_k=2, class_index=1)
+
+        assert err is not None and err.startswith("fallback_used:")
+        assert "RuntimeError: boom" in err
+        assert len(factors) == 2
+        # Tree-less fallback uses value * 0.01 when coef_ is absent.
+        assert factors[0].name == "f0"
+        assert factors[0].impact == pytest.approx(0.1)
+
+        @client.explain()
+        def predict(m, r):
+            return m.predict_proba(r)
+
+        # Restore a SHAP failure path via the patched method still on client.
+        event = predict(model, row)
+        assert event.explanation.status == "degraded"
+        assert event.explanation.quality["used_fallback"] is True
+        assert "fallback_used:" in event.explanation.metadata["attribution_error"]

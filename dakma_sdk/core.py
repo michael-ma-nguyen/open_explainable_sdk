@@ -614,7 +614,12 @@ class DakmaClient:
                     else:
                         model = bound if bound is not None else self._first_model(args, kwargs)
                         row = self._first_dataframe_or_mapping(args, kwargs)
-                        top_factors = self._top_factors(model, row, top_k=top_k)
+                        top_factors, attribution_error = self._top_factors(
+                            model,
+                            row,
+                            top_k=top_k,
+                            class_index=self._score_class_index(raw_decision),
+                        )
                         cached_id, cached_rows = self._shap_fi_model_id, self._shap_fi_rows
 
                     fi_rows: List[FeatureImportance] = []
@@ -693,12 +698,15 @@ class DakmaClient:
 
         explanation = Explanation(
             method=method,
-            status="success" if factors else "degraded",
+            status="success" if factors and not attribution_error else "degraded",
             factors=factors,
             quality={
                 "factor_count": len(factors),
                 "has_global_importance": bool(feature_importance),
                 "method": method,
+                "used_fallback": bool(
+                    attribution_error and str(attribution_error).startswith("fallback_used:")
+                ),
                 **({"token_count": len(tokens)} if tokens else {}),
             },
             plain_language=self._plain_language(decision, factors, input_kind=input_kind),
@@ -1017,11 +1025,28 @@ class DakmaClient:
         value = "APPROVED" if score >= threshold else "DECLINED"
         return Decision(value=value, score=score, threshold=threshold)
 
-    def _top_factors(self, model: Any, row: Any, top_k: int = 3) -> List[TopFactor]:
-        factors = self._top_factors_shap(model, row)
-        if not factors:
-            factors = self._top_factors_fallback(model, row)
-        return factors[:top_k]
+    def _top_factors(
+        self,
+        model: Any,
+        row: Any,
+        top_k: int = 3,
+        *,
+        class_index: Optional[int] = None,
+    ) -> Tuple[List[TopFactor], Optional[str]]:
+        """Return local factors and an optional attribution error.
+
+        On SHAP failure, factors may still come from :meth:`_top_factors_fallback`; in that case
+        the error string starts with ``fallback_used:`` so reports can mark the explanation
+        ``degraded``.
+        """
+        factors, shap_error = self._top_factors_shap(model, row, top_k=top_k, class_index=class_index)
+        if factors:
+            return factors[:top_k], None
+        fallback = self._top_factors_fallback(model, row)
+        if fallback:
+            detail = shap_error or "SHAP produced no local factors"
+            return fallback[:top_k], f"fallback_used: {detail}"
+        return [], shap_error or "no local factors available"
 
     def _reference_dataframe(self, X_reference: Any) -> Optional[Any]:
         pd = _safe_import_pandas()
@@ -1249,27 +1274,80 @@ class DakmaClient:
                     fallback = value
         return fallback
 
-    def _top_factors_shap(self, model: Any, row: Any) -> List[TopFactor]:
+    @staticmethod
+    def _local_shap_vector(
+        shap_values: Any,
+        *,
+        n_features: int,
+        class_index: Optional[int] = None,
+    ) -> np.ndarray:
+        """Reduce one-row SHAP values to a length-``n_features`` vector for the scored class.
+
+        Handles common Explainer layouts:
+
+        - ``(n_features,)`` — already a single-output / selected-class vector
+        - ``(n_features, n_classes)`` — binary / multi-class (slice by ``class_index``)
+        - ``(n_classes, n_features)`` — less common class-major layout
+        """
+        vals = np.asarray(shap_values, dtype=float)
+        if vals.ndim == 1:
+            if int(vals.shape[0]) != int(n_features):
+                raise ValueError(
+                    f"SHAP vector length {vals.shape[0]} does not match n_features={n_features}"
+                )
+            return vals
+        if vals.ndim == 2:
+            if int(vals.shape[0]) == int(n_features):
+                n_classes = int(vals.shape[1])
+                idx = n_classes - 1 if class_index is None else int(class_index)
+                idx = max(0, min(idx, n_classes - 1))
+                return vals[:, idx]
+            if int(vals.shape[1]) == int(n_features):
+                n_classes = int(vals.shape[0])
+                idx = n_classes - 1 if class_index is None else int(class_index)
+                idx = max(0, min(idx, n_classes - 1))
+                return vals[idx, :]
+        raise ValueError(
+            f"Unsupported SHAP value shape {getattr(vals, 'shape', None)} for n_features={n_features}"
+        )
+
+    def _top_factors_shap(
+        self,
+        model: Any,
+        row: Any,
+        *,
+        top_k: int = 3,
+        class_index: Optional[int] = None,
+    ) -> Tuple[List[TopFactor], Optional[str]]:
         shap = _safe_import_shap()
         pd = _safe_import_pandas()
-        if shap is None or model is None or row is None or pd is None:
-            return []
+        if shap is None:
+            return [], "shap is not installed"
+        if model is None or row is None or pd is None:
+            return [], "model, row, or pandas unavailable for SHAP"
 
         try:
             row_df = row if isinstance(row, pd.DataFrame) else pd.DataFrame([row])
             explainer = shap.Explainer(model)
             values = explainer(row_df)
-            shap_vals = np.asarray(values.values[0])
             features = list(row_df.columns)
-            sortable = list(zip(features, row_df.iloc[0].tolist(), shap_vals))
-            sortable.sort(key=lambda x: abs(x[2]), reverse=True)
-            result = []
-            for name, val, impact in sortable[:3]:
-                direction = "up" if impact >= 0 else "down"
-                result.append(TopFactor(name=name, value=val, impact=float(impact), direction=direction))
-            return result
-        except Exception:
-            return []
+            shap_vals = self._local_shap_vector(
+                values.values[0],
+                n_features=len(features),
+                class_index=class_index,
+            )
+            sortable = list(zip(features, row_df.iloc[0].tolist(), shap_vals.tolist()))
+            sortable.sort(key=lambda x: abs(float(x[2])), reverse=True)
+            result: List[TopFactor] = []
+            for name, val, impact in sortable[:top_k]:
+                impact_f = float(impact)
+                direction = "up" if impact_f >= 0 else "down"
+                result.append(TopFactor(name=name, value=val, impact=impact_f, direction=direction))
+            if not result:
+                return [], "SHAP returned an empty factor list"
+            return result, None
+        except Exception as exc:
+            return [], f"{type(exc).__name__}: {exc}"
 
     def _top_factors_fallback(self, model: Any, row: Any) -> List[TopFactor]:
         pd = _safe_import_pandas()
