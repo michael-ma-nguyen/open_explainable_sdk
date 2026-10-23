@@ -48,3 +48,9 @@ examples/reports_svm/*
 !examples/reports_svm/.gitkeep
 examples/reports_text/*
 !examples/reports_text/.gitkeep
+examples/reports_wine/*
+!examples/reports_wine/.gitkeep
+
+# Local-only files
+CLAUDE.md
+dakma_test_plan.md

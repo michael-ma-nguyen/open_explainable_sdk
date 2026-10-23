@@ -35,6 +35,23 @@ def test_credit_scoring_svm_example_runs() -> None:
     assert "Downloadable reports" in result.stdout or "audit_report" in result.stdout
 
 
+@requires_sklearn_ml
+@pytest.mark.smoke
+def test_wine_multiclass_example_runs() -> None:
+    result = _run_example("wine_multiclass_example.py")
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "Downloadable reports" in result.stdout
+    assert "decision_class_2.html" in result.stdout
+
+
+@requires_ml
+@pytest.mark.smoke
+def test_shap_model_matrix_example_runs() -> None:
+    result = _run_example("shap_model_matrix_example.py", timeout=300)
+    assert result.returncode == 0, result.stderr or result.stdout
+    assert "--- Summary ---" in result.stdout
+
+
 @requires_dl
 @pytest.mark.smoke
 def test_mlp_integrated_gradients_example_runs() -> None:
