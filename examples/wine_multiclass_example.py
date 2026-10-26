@@ -107,7 +107,7 @@ if __name__ == "__main__":
         human_oversight="Not used for decisions; explainability test harness.",
         data_provenance="sklearn.datasets.load_wine (UCI Wine recognition dataset).",
         model_changelog=[
-            {"version": "demo-1.0", "date": "2026-10-19", "notes": "RandomForest + SHAP multi-class test"},
+            {"version": "demo-1.1.0", "date": "2026-10-23", "notes": "RandomForest + SHAP multi-class test"},
         ],
     )
     dm_w.register_evaluation(

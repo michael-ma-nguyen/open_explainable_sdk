@@ -20,6 +20,25 @@ DOCUMENTATION_DISCLAIMER_HTML = (
 )
 
 
+def _decision_rows(dec_out: Dict[str, Any]) -> List[Any]:
+    """Field/value rows for the Decision table (multi-class decisions have no threshold)."""
+    try:
+        sc = float(dec_out.get("score")) if dec_out.get("score") is not None else None
+        th = float(dec_out.get("threshold")) if dec_out.get("threshold") is not None else None
+        score_s = f"{sc:.2f}" if sc is not None else "—"
+        th_s = f"{th:.2f}" if th is not None else "—"
+    except (TypeError, ValueError):
+        score_s = _cell(dec_out.get("score"))
+        th_s = _cell(dec_out.get("threshold"))
+    if dec_out.get("predicted_class") is not None:
+        return [
+            ("predicted class", dec_out.get("predicted_class")),
+            ("class index", dec_out.get("class_index")),
+            ("probability", score_s),
+        ]
+    return [("label", dec_out.get("label")), ("score", score_s), ("threshold", th_s)]
+
+
 def _cell(value: Any, *, max_len: int = 500) -> str:
     if value is None:
         return "—"
@@ -466,22 +485,11 @@ def format_inference_result_markdown(
     raw_decision = result_dict.get("decision")
 
     parts.append("**Decision**")
-    try:
-        sc = float(dec_out.get("score")) if dec_out.get("score") is not None else None
-        th = float(dec_out.get("threshold")) if dec_out.get("threshold") is not None else None
-        score_s = f"{sc:.2f}" if sc is not None else "—"
-        th_s = f"{th:.2f}" if th is not None else "—"
-    except (TypeError, ValueError):
-        score_s = _cell(dec_out.get("score"))
-        th_s = _cell(dec_out.get("threshold"))
+    decision_rows = _decision_rows(dec_out)
     parts.append(
         _markdown_table(
             ["Field", "Value"],
-            [
-                ("label", dec_out.get("label")),
-                ("score", score_s),
-                ("threshold", th_s),
-            ],
+            decision_rows,
         )
     )
     parts.append("")
@@ -1118,24 +1126,13 @@ def format_inference_result_html(
     explain = result_dict.get("explain") or {}
     raw_decision = result_dict.get("decision")
 
-    try:
-        sc = float(dec_out.get("score")) if dec_out.get("score") is not None else None
-        th = float(dec_out.get("threshold")) if dec_out.get("threshold") is not None else None
-        score_s = f"{sc:.2f}" if sc is not None else "—"
-        th_s = f"{th:.2f}" if th is not None else "—"
-    except (TypeError, ValueError):
-        score_s = _cell(dec_out.get("score"))
-        th_s = _cell(dec_out.get("threshold"))
+    decision_rows = _decision_rows(dec_out)
 
     parts.append(_html_h3("Decision"))
     parts.append(
         _html_table(
             ["Field", "Value"],
-            [
-                ("label", dec_out.get("label")),
-                ("score", score_s),
-                ("threshold", th_s),
-            ],
+            decision_rows,
         )
     )
     parts.append(_html_h3("Raw model output (unchanged)"))

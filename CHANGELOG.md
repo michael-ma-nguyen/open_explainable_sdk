@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- **Multi-class models (3+ outputs) now use the predicted class.** `Decision.value` is the
+  highest-probability class, `Decision.score` its probability, and SHAP explains that class (previously
+  always the last class). Binary models keep the APPROVED / DECLINED threshold decision. 
+- `Decision` gains optional `predicted_class` and `class_index` (multi-class only; `threshold` unused).
+  Reports and plain-language / counterfactual text use the class instead of approve / decline.
+- Local SHAP falls back to a background-based explainer when `shap.Explainer(model)` alone fails
+  (multi-class `GradientBoostingClassifier`, `LogisticRegression`). Tree models are unchanged.
+
+### Added
+
+- `explain(target_class=...)` explains a chosen output index without changing the decision.
+- `register_shap_feature_importance` keeps up to 100 reference rows as the fallback background.
+  Without it these models still degrade, and the error now says how to fix it.
+
+### Known limitations
+
+- Class names come from `model.classes_`, so integer labels show as `0` / `1` / `2`.
+
 ## [1.1.0] - 2026-10-22
 
 ### Fixed

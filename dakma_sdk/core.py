@@ -160,6 +160,7 @@ class ModelHandle:
         counterfactual: bool = False,
         threshold: float = 0.5,
         top_k: int = 3,
+        target_class: Optional[int] = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., DecisionEvent]]:
         """Decorate inference so it returns a :class:`~dakma_sdk.models.DecisionEvent` (SHAP)."""
         return self._client._explain_decorator(
@@ -168,6 +169,7 @@ class ModelHandle:
             counterfactual=counterfactual,
             threshold=threshold,
             top_k=top_k,
+            target_class=target_class,
         )
 
     def explain_integrated_gradients(
@@ -243,6 +245,9 @@ class DakmaClient:
         self._default_dataset: Optional[Dataset] = None
         self._shap_fi_model_id: Optional[int] = None
         self._shap_fi_rows: List[FeatureImportance] = []
+        #: Background rows kept by ``register_shap_feature_importance`` for models SHAP can't explain alone.
+        self._shap_background: Any = None
+        self._shap_background_model_id: Optional[int] = None
         self._ig_fi_model_id: Optional[int] = None
         self._ig_fi_rows: List[FeatureImportance] = []
         self._governance: Dict[str, Any] = {}
@@ -443,10 +448,15 @@ class DakmaClient:
         counterfactual: bool = False,
         threshold: float = 0.5,
         top_k: int = 3,
+        target_class: Optional[int] = None,
     ) -> Callable[[Callable[..., Any]], Callable[..., DecisionEvent]]:
         """Decorate inference so it returns a :class:`~dakma_sdk.models.DecisionEvent` (SHAP).
 
         Use :meth:`model` first when you want typed model and dataset provenance on the event.
+
+        Models with 3+ outputs are treated as multi-class: the decision is the highest-probability
+        class and SHAP explains that class. Pass ``target_class`` (an output index) to explain a
+        different class; the decision itself is unchanged.
         """
         return self._explain_decorator(
             None,
@@ -454,6 +464,7 @@ class DakmaClient:
             counterfactual=counterfactual,
             threshold=threshold,
             top_k=top_k,
+            target_class=target_class,
         )
 
     def register_shap_feature_importance(
@@ -473,6 +484,10 @@ class DakmaClient:
         rows = self._global_shap_feature_importance(model, X_reference, max_samples=max_samples, top_k=top_k)
         self._shap_fi_rows = rows
         self._shap_fi_model_id = id(model) if model is not None and rows else None
+        background = self._reference_dataframe(X_reference)
+        if model is not None and background is not None and len(background) > 0:
+            self._shap_background = background.sample(n=min(100, len(background)), random_state=0)
+            self._shap_background_model_id = id(model)
 
     def explain_integrated_gradients(
         self,
@@ -577,6 +592,8 @@ class DakmaClient:
                 bound = handle.artifact if handle is not None else None
                 token_attrs: List[TokenAttribution] = []
                 attribution_error: Optional[str] = None
+                multiclass_decision: Optional[Decision] = None
+                explained_class: Optional[int] = None
                 with ComputeUsageRecorder() as rec:
                     raw_decision = fn(*args, **kwargs)
 
@@ -614,11 +631,18 @@ class DakmaClient:
                     else:
                         model = bound if bound is not None else self._first_model(args, kwargs)
                         row = self._first_dataframe_or_mapping(args, kwargs)
+                        multiclass_decision = self._multiclass_decision(raw_decision, model)
+                        if target_class is not None:
+                            explained_class = int(target_class)
+                        elif multiclass_decision is not None:
+                            explained_class = multiclass_decision.class_index
+                        else:
+                            explained_class = self._score_class_index(raw_decision)
                         top_factors, attribution_error = self._top_factors(
                             model,
                             row,
                             top_k=top_k,
-                            class_index=self._score_class_index(raw_decision),
+                            class_index=explained_class,
                         )
                         cached_id, cached_rows = self._shap_fi_model_id, self._shap_fi_rows
 
@@ -626,8 +650,23 @@ class DakmaClient:
                     if cached_id is not None and model is not None and id(model) == cached_id:
                         fi_rows = list(cached_rows)
 
-                    decision = self._to_decision(self._extract_score(raw_decision), threshold)
-                    counterfactual_text = self._counterfactual(top_factors) if counterfactual else None
+                    decision = multiclass_decision or self._to_decision(
+                        self._extract_score(raw_decision), threshold
+                    )
+                    counterfactual_text = (
+                        self._counterfactual(
+                            top_factors,
+                            explained_class=(
+                                decision.predicted_class
+                                if explained_class == decision.class_index
+                                else str(explained_class)
+                            )
+                            if decision.predicted_class is not None
+                            else None,
+                        )
+                        if counterfactual
+                        else None
+                    )
 
                 event = self._build_decision_event(
                     handle=handle,
@@ -642,6 +681,7 @@ class DakmaClient:
                     input_kind=input_kind,
                     text_attributions=token_attrs,
                     attribution_error=attribution_error,
+                    explained_class=explained_class if multiclass_decision is not None else None,
                 )
                 self._record_decision_event(event, function_name=fn.__name__)
                 return event
@@ -665,6 +705,7 @@ class DakmaClient:
         input_kind: str = "tabular",
         text_attributions: Optional[List[TokenAttribution]] = None,
         attribution_error: Optional[str] = None,
+        explained_class: Optional[int] = None,
     ) -> DecisionEvent:
         audit_id = self._audit_trail_id()
         governance = dict(self._governance) if self._governance else None
@@ -695,6 +736,8 @@ class DakmaClient:
             metadata["input_kind"] = input_kind
         if attribution_error:
             metadata["attribution_error"] = attribution_error
+        if explained_class is not None:
+            metadata["explained_class_index"] = explained_class
 
         explanation = Explanation(
             method=method,
@@ -1015,6 +1058,36 @@ class DakmaClient:
         return int(arr.shape[-1] - 1)
 
     @staticmethod
+    def _multiclass_decision(raw_decision: Any, model: Any) -> Optional[Decision]:
+        """Highest-probability class as the decision when the model has 3+ outputs, else ``None``.
+
+        Binary and single-output models keep the APPROVED / DECLINED threshold decision.
+        """
+        try:
+            arr = np.asarray(raw_decision, dtype=float)
+        except Exception:
+            return None
+        if arr.ndim == 0 or arr.shape[-1] < 3:
+            return None
+        first = arr.reshape(-1, arr.shape[-1])[0]
+        idx = int(np.argmax(first))
+        name = f"class_{idx}"
+        classes = getattr(model, "classes_", None)
+        if classes is not None:
+            try:
+                if len(classes) == len(first):
+                    name = str(classes[idx])
+            except Exception:
+                pass
+        return Decision(
+            value=name,
+            score=float(first[idx]),
+            threshold=0.0,
+            predicted_class=name,
+            class_index=idx,
+        )
+
+    @staticmethod
     def _to_decision_output(score: float, threshold: float) -> DecisionOutput:
         if score >= threshold:
             return DecisionOutput(label="APPROVED", score=score, threshold=threshold)
@@ -1328,9 +1401,20 @@ class DakmaClient:
 
         try:
             row_df = row if isinstance(row, pd.DataFrame) else pd.DataFrame([row])
-            explainer = shap.Explainer(model)
-            values = explainer(row_df)
             features = list(row_df.columns)
+            try:
+                values = shap.Explainer(model)(row_df)
+            except Exception as first_exc:
+                # Some models (multi-class GradientBoosting, linear models) need background data.
+                background = self._shap_background if id(model) == self._shap_background_model_id else None
+                if background is None or not all(f in background.columns for f in features):
+                    return [], (
+                        f"{type(first_exc).__name__}: {first_exc} "
+                        "(call register_shap_feature_importance(model, X_train) to enable "
+                        "background-based SHAP for this model)"
+                    )
+                predict = getattr(model, "predict_proba", None) or model.predict
+                values = shap.Explainer(predict, background[features], seed=0)(row_df)
             shap_vals = self._local_shap_vector(
                 values.values[0],
                 n_features=len(features),
@@ -1378,10 +1462,18 @@ class DakmaClient:
         return top
 
     @staticmethod
-    def _counterfactual(factors: List[TopFactor]) -> Optional[str]:
+    def _counterfactual(factors: List[TopFactor], explained_class: Optional[str] = None) -> Optional[str]:
         if not factors:
             return None
         dominant = factors[0]
+        if explained_class is not None:
+            try:
+                target = float(dominant.value) * 0.7
+                change = f"{dominant.name} < {target:.2f}"
+            except Exception:
+                change = f"{dominant.name} is lower"
+            likelihood = "more" if dominant.impact < 0 else "less"
+            return f"Class {explained_class} would be {likelihood} likely if {change}"
         if dominant.impact < 0:
             try:
                 target = float(dominant.value) * 0.7
@@ -1415,17 +1507,19 @@ class DakmaClient:
         *,
         input_kind: str = "tabular",
     ) -> str:
+        predicted_class = getattr(decision, "predicted_class", None)
+        lead = f"Predicted class {predicted_class}" if predicted_class is not None else decision.label.title()
         if not factors:
-            return f"{decision.label.title()}. Decision generated by model score and threshold."
+            return f"{lead}. Decision generated by model score and threshold."
         reason = factors[0]
         if input_kind == "text":
             return (
-                f"{decision.label.title()}. Main driver: the token \"{reason.name}\" "
+                f"{lead}. Main driver: the token \"{reason.name}\" "
                 f"which moved the score {'down' if reason.impact < 0 else 'up'}."
             )
         direction = "high" if isinstance(reason.value, (int, float)) and float(reason.value) > 0 else "low"
         return (
-            f"{decision.label.title()}. Main reason: {direction} {reason.name.replace('_', ' ')} "
+            f"{lead}. Main reason: {direction} {reason.name.replace('_', ' ')} "
             f"which moved the score {'down' if reason.impact < 0 else 'up'}."
         )
 
